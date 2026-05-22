@@ -30,7 +30,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Eto ang koneksyon para sa permanenteng VIP Keys
+# Koneksyon para sa permanenteng VIP Keys sa Supabase
 def get_db_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable is missing sa Render!")
@@ -77,14 +77,14 @@ def convert_duration(duration: str):
     return 1800
 
 # ======================
-# HOME
+# HOME ROUTE
 # ======================
 @app.route("/")
 def home():
     return "KAZE SERVER ONLINE"
 
 # ======================
-# TOKEN
+# TOKEN ROUTE
 # ======================
 @app.route("/token")
 def token():
@@ -111,20 +111,18 @@ def token():
     })
 
 # ======================
-# GENERATE KEY
+# GENERATE STANDARD KEY
 # ======================
 @app.route("/getkey")
 def getkey():
     token_id = request.args.get("token")
     source = request.args.get("src", "site")
     duration = request.args.get("duration", "12h")
+    max_dev = request.args.get("max", "1")  # Default ay 1 device limit
     now = time.time()
 
-    if not token_id:
-        return jsonify({"status": "error", "message": "Missing token"}), 403
-
-    if token_id not in db_cache["tokens"]:
-        return jsonify({"status": "error", "message": "Token expired. Please generate again."}), 403
+    if not token_id or token_id not in db_cache["tokens"]:
+        return jsonify({"status": "error", "message": "Token expired"}), 403
 
     token_data = db_cache["tokens"][token_id]
     ip = token_data["ip"]
@@ -132,20 +130,19 @@ def getkey():
     if ip in db_cache["ip_limit"]:
         wait = int(KEY_LIMIT - (now - db_cache["ip_limit"][ip]))
         if wait > 0:
-            return jsonify({"status": "wait", "message": "Bypass detected! Try again in main page"}), 403
+            return jsonify({"status": "wait", "message": "Bypass detected!"}), 403
 
     prefix = "Kaze-" if source == "bot" else "KazeFreeKey-"
     key = prefix + ''.join(random.choices(string.ascii_letters + string.digits, k=12))
     expiry_seconds = convert_duration(duration)
 
-    # 💾 DIREKTANG PAG-SAVE SA SUPABASE
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO keys (key_code, expiry, device, revoked, login_time)
-            VALUES (%s, %s, NULL, FALSE, NULL);
-        """, (key, now + expiry_seconds))
+            INSERT INTO keys (key_code, expiry, device, revoked, login_time, max_devices)
+            VALUES (%s, %s, NULL, FALSE, NULL, %s);
+        """, (key, now + expiry_seconds, int(max_dev)))
         conn.commit()
         cur.close()
         conn.close()
@@ -158,63 +155,70 @@ def getkey():
     return jsonify({
         "status": "success",
         "key": key,
-        "expires_in": expiry_seconds
+        "expires_in": expiry_seconds,
+        "max_devices": max_dev
     })
     
 # ======================
-# VERIFY KEY
+# VERIFY KEY (UPDATED TELEGRAM NOTIF)
 # ======================
 @app.route("/verify")
 def verify():
     cleanup()
     key = request.args.get("key")
     device = request.args.get("device")
-    
-    if not key or not device: 
-        return "invalid"
+    if not key or not device: return "invalid"
 
-    # 🔍 PAG-BASA MULA SA SUPABASE
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM keys WHERE key_code = %s;", (key,))
     data = cur.fetchone()
 
     if not data:
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
         return "invalid"
 
     if data["revoked"]:
-        cur.close()
-        conn.close()
-        send_telegram_alert(f"*Key Revoked*\nKey: `{key}`\nDevice: `{device}`")
+        cur.close(); conn.close()
+        send_telegram_alert(f"❌ *Key Revoked Attempt*\nKey: `{key}`\nDevice: `{device}`")
         return "revoked"
 
     if time.time() > data["expiry"]:
-        cur.close()
-        conn.close()
-        send_telegram_alert(f"*Key Expired*\nKey: `{key}`\nDevice: `{device}`")
+        cur.close(); conn.close()
+        send_telegram_alert(f"❌ *Key Expired Attempt*\nKey: `{key}`\nDevice: `{device}`")
         return "expired"
 
-    if data["device"] is None:
-        cur.execute("UPDATE keys SET device = %s, login_time = %s WHERE key_code = %s;", (device, time.time(), key))
+    current_devices = data["device"].split(",") if data["device"] else []
+    max_allowed = data.get("max_devices", 1)
+    remaining_seconds = int(data["expiry"] - time.time())
+    time_left_str = format_remaining_time(remaining_seconds)
+
+    # Case 1: Ang device na ito ay naka-login na dati pa (Re-login)
+    if device in current_devices:
+        cur.close(); conn.close()
+        device_index = current_devices.index(device) + 1
+        
+        # Pagandahin ang notif depende kung multi-device o single device
+        counter_str = f" ({device_index}/{max_allowed})" if max_allowed > 1 else ""
+        send_telegram_alert(f"✓ *Key Used{counter_str}*\nKey: `{key}`\nDevice: `{device}`\nExpires in: `{time_left_str}`")
+        return "valid"
+
+    # Case 2: May bakante pang slot para sa bagong device
+    if len(current_devices) < max_allowed:
+        current_devices.append(device)
+        new_device_string = ",".join(current_devices)
+        
+        cur.execute("UPDATE keys SET device = %s, login_time = %s WHERE key_code = %s;", (new_device_string, time.time(), key))
         conn.commit()
-        cur.close()
-        conn.close()
-        remaining = int(data["expiry"] - time.time())
-        send_telegram_alert(f"*Key Used*\nKey: `{key}`\nDevice: `{device}`\nExpires in: `{remaining}s`")
+        cur.close(); conn.close()
+        
+        counter_str = f" ({len(current_devices)}/{max_allowed})" if max_allowed > 1 else ""
+        send_telegram_alert(f"✓ *Key Used{counter_str}*\nKey: `{key}`\nDevice: `{device}`\nExpires in: `{time_left_str}`")
         return "valid"
 
-    if data["device"] == device:
-        cur.close()
-        conn.close()
-        remaining = int(data["expiry"] - time.time())
-        send_telegram_alert(f"*Key Used*\nKey: `{key}`\nDevice: `{device}`\nExpires in: `{remaining}s`")
-        return "valid"
-
-    cur.close()
-    conn.close()
-    send_telegram_alert(f"*Key Locked - Device Mismatch*\nKey: `{key}`\nDevice Attempt: `{device}`\nAssigned Device: `{data['device']}`")
+    # Case 3: Puno na ang slots (Device Mismatch / Locked)
+    cur.close(); conn.close()
+    send_telegram_alert(f"🔒 *Max Device Limit Reached*\nKey: `{key}`\nAttempt Device: `{device}`\nSlots: `{len(current_devices)}/{max_allowed}`")
     return "locked"
 
 # ======================
@@ -223,8 +227,7 @@ def verify():
 @app.route("/revoke")
 def revoke():
     key = request.args.get("key")
-    if not key: 
-        return jsonify({"status": "error", "message": "Key missing"}), 400
+    if not key: return jsonify({"status": "error"}), 400
     
     conn = get_db_connection()
     cur = conn.cursor()
@@ -234,27 +237,24 @@ def revoke():
     cur.close()
     conn.close()
     
-    if count == 0:
-        return jsonify({"status": "error", "message": "Key not found"}), 404
-        
+    if count == 0: return jsonify({"status": "error"}), 404
     send_telegram_alert(f"🚫 *Key Revoked*\nKey: `{key}`")
-    return jsonify({"status": "success", "message": f"{key} revoked"})
+    return jsonify({"status": "success"})
 
 # ======================
 # LIST ACTIVE KEYS
 # ======================
 @app.route("/list")
 def list_keys():
-    cleanup()
     now = time.time()
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT key_code, device, expiry FROM keys WHERE revoked = FALSE AND expiry > %s;", (now,))
+    cur.execute("SELECT key_code, device, expiry, max_devices FROM keys WHERE revoked = FALSE AND expiry > %s;", (now,))
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
-    result = [{"key": r["key_code"], "device": r["device"], "expire_in": int(r["expiry"] - now)} for r in rows]
+    result = [{"key": r["key_code"], "device": r["device"], "max": r["max_devices"]} for r in rows]
     return jsonify(result)
 
 # ======================
@@ -262,7 +262,6 @@ def list_keys():
 # ======================
 @app.route("/stats")
 def stats():
-    cleanup()
     now = time.time()
     conn = get_db_connection()
     cur = conn.cursor()
